@@ -12,7 +12,7 @@ import streamlit as st
 from datetime import datetime, timezone
 
 st.set_page_config(page_title="Trend Ensemble Paper Terminal", layout="wide")
-BASE = "https://fapi.binance.com"
+BASE = "https://api.bybit.com"
 SYMBOLS = ["BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT"]
 FEE_RATE = 0.0006  # Pine commission_value=0.06%, charged on traded notional
 INTERVAL_MS = 60 * 60 * 1000
@@ -33,21 +33,53 @@ with st.sidebar:
     st.info("This is a simulation. Funding, slippage, liquidation engine and exchange quantity filters are not modelled.")
 
 @st.cache_data(ttl=25, show_spinner=False)
-def get_klines(symbol, interval="1h", limit=1200):
-    url = f"{BASE}/fapi/v1/klines"
-    r = requests.get(url, params={"symbol": symbol, "interval": interval, "limit": limit}, timeout=20)
+def get_klines(symbol, interval="1h", limit=1000):
+    url = f"{BASE}/v5/market/kline"
+
+    params = {
+        "category": "linear",
+        "symbol": symbol,
+        "interval": "60",
+        "limit": limit
+    }
+
+    r = requests.get(url, params=params, timeout=20)
     r.raise_for_status()
-    raw = r.json()
-    cols = ["open_time","open","high","low","close","volume","close_time","quote_volume","trades","taker_base","taker_quote","ignore"]
+
+    data = r.json()
+
+    if data.get("retCode") != 0:
+        raise RuntimeError(data.get("retMsg", "Bybit API error"))
+
+    raw = data["result"]["list"]
+
+    if not raw:
+        raise RuntimeError(f"No market data returned for {symbol}")
+
+    cols = [
+        "open_time", "open", "high", "low",
+        "close", "volume", "turnover"
+    ]
+
     df = pd.DataFrame(raw, columns=cols)
-    for c in ["open","high","low","close","volume"]:
+
+    for c in ["open", "high", "low", "close", "volume"]:
         df[c] = pd.to_numeric(df[c], errors="coerce")
-    df["open_time"] = pd.to_datetime(df["open_time"], unit="ms", utc=True)
-    df["close_time"] = pd.to_datetime(df["close_time"], unit="ms", utc=True)
-    # Exclude the currently forming hourly candle; use only confirmed candles.
+
+    df["open_time"] = pd.to_datetime(
+        pd.to_numeric(df["open_time"]),
+        unit="ms",
+        utc=True
+    )
+
+    df["close_time"] = df["open_time"] + pd.Timedelta(hours=1)
+
+    df = df.sort_values("open_time").reset_index(drop=True)
+
     now = pd.Timestamp.now(tz="UTC")
-    df = df[df["close_time"] < now].copy().reset_index(drop=True)
-    return df
+    df = df[df["close_time"] < now].copy()
+
+    return df.reset_index(drop=True)
 
 def tanh_clip(x):
     if pd.isna(x) or not np.isfinite(x):
