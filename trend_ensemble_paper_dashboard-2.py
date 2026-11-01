@@ -12,13 +12,13 @@ import streamlit as st
 from datetime import datetime, timezone
 
 st.set_page_config(page_title="Trend Ensemble Paper Terminal", layout="wide")
-BASE = "https://api.bybit.com"
+API_BASE = "https://api.coinbeacon.io"
 SYMBOLS = ["BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT"]
 FEE_RATE = 0.0006  # Pine commission_value=0.06%, charged on traded notional
 INTERVAL_MS = 60 * 60 * 1000
 
 st.title("Trend Ensemble — Futures Paper Trading")
-st.caption("Public Binance USD-M Futures market data • Virtual fills only • No API key • No live orders")
+st.caption("Binance Futures market data via CoinBeacon • Virtual fills only • No exchange orders")
 
 with st.sidebar:
     st.header("Paper account")
@@ -32,54 +32,48 @@ with st.sidebar:
     refresh_secs = st.selectbox("Refresh interval", [15, 30, 60, 120], index=1)
     st.info("This is a simulation. Funding, slippage, liquidation engine and exchange quantity filters are not modelled.")
 
-@st.cache_data(ttl=25, show_spinner=False)
-def get_klines(symbol, interval="1h", limit=1000):
-    url = f"{BASE}/v5/market/kline"
-
-    params = {
-        "category": "linear",
-        "symbol": symbol,
-        "interval": "60",
-        "limit": limit
-    }
-
-    r = requests.get(url, params=params, timeout=20)
-    r.raise_for_status()
-
-    data = r.json()
-
-    if data.get("retCode") != 0:
-        raise RuntimeError(data.get("retMsg", "Bybit API error"))
-
-    raw = data["result"]["list"]
-
-    if not raw:
-        raise RuntimeError(f"No market data returned for {symbol}")
-
-    cols = [
-        "open_time", "open", "high", "low",
-        "close", "volume", "turnover"
-    ]
-
-    df = pd.DataFrame(raw, columns=cols)
-
+@st.cache_data(ttl=600, show_spinner=False)
+def get_klines(symbol, _api_key):
+    url = f"{API_BASE}/public/ohlcv/binance-futures/{symbol}/1h"
+    response = requests.get(url, headers={"X-API-Key": _api_key},
+                            params={"limit": 1000}, timeout=25)
+    response.raise_for_status()
+    payload = response.json()
+    bars = payload.get("bars", [])
+    if not bars:
+        raise RuntimeError(f"CoinBeacon returned no hourly bars for {symbol}: {payload}")
+    df = pd.DataFrame(bars)
+    required = ["openTime", "open", "high", "low", "close", "volume", "closeTime"]
+    missing = [c for c in required if c not in df.columns]
+    if missing:
+        raise RuntimeError(f"Unexpected CoinBeacon candle response; missing {missing}")
     for c in ["open", "high", "low", "close", "volume"]:
         df[c] = pd.to_numeric(df[c], errors="coerce")
-
-    df["open_time"] = pd.to_datetime(
-        pd.to_numeric(df["open_time"]),
-        unit="ms",
-        utc=True
-    )
-
-    df["close_time"] = df["open_time"] + pd.Timedelta(hours=1)
-
-    df = df.sort_values("open_time").reset_index(drop=True)
-
+    df["open_time"] = pd.to_datetime(pd.to_numeric(df["openTime"]), unit="ms", utc=True)
+    df["close_time"] = pd.to_datetime(pd.to_numeric(df["closeTime"]), unit="ms", utc=True)
     now = pd.Timestamp.now(tz="UTC")
     df = df[df["close_time"] < now].copy()
+    df = df.sort_values("open_time").drop_duplicates("open_time").reset_index(drop=True)
+    return df[["open_time", "open", "high", "low", "close", "volume", "close_time"]]
 
-    return df.reset_index(drop=True)
+
+@st.cache_data(ttl=600, show_spinner=False)
+def get_live_quotes(_api_key):
+    markets = ",".join(f"binance-futures:{s}" for s in SYMBOLS)
+    response = requests.get(
+        f"{API_BASE}/public/market/quotes/batch",
+        headers={"X-API-Key": _api_key}, params={"m": markets}, timeout=25
+    )
+    response.raise_for_status()
+    payload = response.json()
+    result = {}
+    for row in payload.get("quotes", []):
+        symbol = row.get("m", "").split(":", 1)[-1]
+        price = row.get("price")
+        if symbol in SYMBOLS and price is not None:
+            result[symbol] = float(price)
+    return result
+
 
 def tanh_clip(x):
     if pd.isna(x) or not np.isfinite(x):
@@ -152,7 +146,7 @@ with c1:
         init_state(starting_balance)
         st.session_state.running = False
 with c2:
-    st.warning("PAPER MODE ONLY — simulated positions and P&L. No Binance order endpoint is called.")
+    st.warning("PAPER MODE ONLY — simulated positions and P&L. No exchange order endpoint is called.")
 
 if starting_balance != st.session_state.last_config_balance and not st.session_state.paper["trades"]:
     st.session_state.paper["cash"] = float(starting_balance)
@@ -206,12 +200,25 @@ def rebalance(symbol, sig, price):
                         "price": price, "notional": abs(delta_qty*price), "fee": fee,
                         "realized_pnl": realized, "new_target_weight": target_weight})
 
+# Read the API key from Streamlit Secrets; never put it in this source file.
+try:
+    COINBEACON_API_KEY = str(st.secrets["COINBEACON_API_KEY"]).strip()
+except Exception:
+    st.error("Missing COINBEACON_API_KEY. Add it in Streamlit → Manage app → Settings → Secrets.")
+    st.stop()
+
 # Fetch all four symbols. Signals are acted on once per newly closed 1h candle.
 errors, signals, prices = {}, {}, {}
-with st.spinner("Loading confirmed hourly futures candles..."):
+with st.spinner("Loading Binance Futures candles through CoinBeacon..."):
+    try:
+        quote_prices = get_live_quotes(COINBEACON_API_KEY)
+    except Exception as quote_error:
+        quote_prices = {}
+        errors["Quotes"] = f"Live quote request failed: {quote_error}"
+
     for sym in SYMBOLS:
         try:
-            df = get_klines(sym)
+            df = get_klines(sym, COINBEACON_API_KEY)
             if len(df) < 1000:
                 errors[sym] = f"Only {len(df)} confirmed hourly candles returned; strategy needs at least ~960 plus volatility history."
                 continue
@@ -222,10 +229,8 @@ with st.spinner("Loading confirmed hourly futures candles..."):
             signals[sym] = sig
             # Use a current public ticker quote for simulated execution/mark-to-market,
             # while keeping the signal based only on the last confirmed 1H candle.
-            ticker = requests.get(f"{BASE}/fapi/v1/ticker/price",
-                                  params={"symbol": sym}, timeout=15)
-            ticker.raise_for_status()
-            live_price = float(ticker.json()["price"])
+            # Current quote is used for paper marking; signal uses confirmed 1H candles.
+            live_price = quote_prices.get(sym, sig["price"])
             prices[sym] = live_price
             st.session_state.paper["positions"][sym]["last_price"] = live_price
             last = st.session_state.paper["last_bar"].get(sym)
@@ -259,7 +264,7 @@ if prices:
     st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
     st.caption(f"Gross position notional: ${gross:,.2f} • Gross leverage vs equity: {gross/max(equity,1e-9):.2f}x • Bot: {'RUNNING' if st.session_state.running else 'PAUSED'}")
 else:
-    st.error("No market data was loaded. Check Binance Futures public API access from your network.")
+    st.error("No usable market data was loaded. Check CoinBeacon API key, API response and candle-history depth.")
 
 if errors:
     with st.expander("Market data/API diagnostics"):
